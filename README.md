@@ -13,27 +13,6 @@
 -   Сбрасывать рабочую область в исходное состояние.
 
 ## Структура проекта
-
-
-svg-polygon-app/
-├── src/
-│ ├── components/
-│ │ ├── buffer-zone.js
-│ │ ├── toolbar.js
-│ │ ├── workspace.js
-│ │ ├── axes.js
-│ │ ├── polygon.js
-│ │ ├── dragging-area.js
-│ │
-│ ├── css/
-│ │ └── styles.css
-│ ├── utils/
-│ │ └── dom-utils.js
-│ ├── app.js
-│ └── index.html
-├── package.json
-└── webpack.config.js
-
       
 -   **`src/components`**: Содержит отдельные веб-компоненты, каждый из которых отвечает за определенную часть функционала.
     -   `buffer-zone.js`: Компонент для буферной зоны, где генерируются случайные полигоны.
