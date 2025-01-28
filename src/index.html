@@ -1,0 +1,833 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8" />
+    <title>SVG Polygons</title>
+    <style>
+        :root {
+            --zone-height: 300px;
+            --primary-color: #212529;
+            --bg-color: #212529;
+            --text-color: #fff;
+            --toolbar-bg: #343a40;
+            --border-color: #495057;
+            --axis-color: #ccc;
+            --grid-color: rgba(255, 255, 255, 0.2);
+            --grid-step: 50;
+            --polygon-color: rgba(255, 0, 0, 0.6);
+        }
+
+        body {
+            margin: 0;
+            font-family: Arial, sans-serif;
+            display: flex;
+            flex-direction: column;
+            height: 100vh;
+            background-color: var(--bg-color);
+            color: var(--text-color);
+        }
+
+        .toolbar {
+            padding: 12px;
+            background: var(--toolbar-bg);
+            border-bottom: 1px solid var(--border-color);
+            display: flex;
+            gap: 1rem;
+        }
+
+        button {
+            padding: 8px 16px;
+            background: var(--primary-color);
+            color: #fff;
+            border: none;
+            border-radius: 20px;
+            font-weight: 500;
+            cursor: pointer;
+        }
+
+        /* "Буфер" сверху, где генерируются случайные <polygon> */
+        .buffer-zone {
+            border: 2px solid var(--border-color);
+            height: var(--zone-height);
+            position: relative;
+            background: var(--bg-color);
+            margin-bottom: 4px;
+        }
+
+        #bufferSvg {
+            width: 100%;
+            height: 100%;
+            background: var(--bg-color);
+        }
+
+        /* Основная рабочая зона */
+        .workspace-container {
+            flex: 1;
+            position: relative;
+            /* для абсолютного позиционирования осей и пр. */
+            overflow: hidden;
+            background: var(--bg-color);
+        }
+
+        /* Линейки */
+        .ruler-svg {
+            position: absolute;
+            top: 0px;
+            left: 0px;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
+        }
+
+        .ruler-line {
+            stroke: var(--axis-color);
+            stroke-width: 2;
+        }
+
+        .ruler-tick {
+            stroke: var(--axis-color);
+            stroke-width: 1;
+        }
+
+        .ruler-label {
+            fill: var(--axis-color);
+            font-size: 14px;
+            text-anchor: middle;
+            dominant-baseline: text-after-edge;
+        }
+
+        .ruler-label.vertical {
+            text-anchor: end;
+            dominant-baseline: middle;
+        }
+
+
+        /* Оси (статичны) */
+        .axes-svg {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
+        }
+
+        /* Основное svg для сетки+контента (масштабируемо) */
+        .main-svg {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            cursor: grab;
+            /* для панорамирования */
+        }
+
+        /* Вспомогательный svg для "клона" при переносе, в position: fixed */
+        #draggingSvg {
+            position: fixed;
+            top: 0;
+            left: 0;
+            pointer-events: none;
+            width: 200px;
+            height: 200px;
+            overflow: visible;
+            z-index: 9999;
+            /* над всем */
+        }
+    </style>
+</head>
+
+<body>
+    <div class="toolbar">
+        <button id="createBtn">Создать</button>
+        <button id="saveBtn">Сохранить</button>
+        <button id="resetBtn">Сбросить</button>
+    </div>
+
+    <!-- БУФЕР с отдельным <svg>, куда генерируем случайные <polygon> -->
+    <div class="buffer-zone">
+        <svg id="bufferSvg"></svg>
+    </div>
+
+    <!-- Основной контейнер: оси (статичны) + SVG с сеткой и контентом -->
+    <div class="workspace-container">
+        <svg class="ruler-svg" id="rulerSvg"></svg>
+        <svg class="axes-svg" id="axesSvg"></svg>
+
+        <svg class="main-svg" id="mainSvg">
+            <g id="gridGroup"></g>
+            <g id="contentGroup"></g>
+        </svg>
+    </div>
+
+    <!-- "Вспомогательное" svg для переноса полигона (клон) -->
+    <svg id="draggingSvg"></svg>
+
+    <script>
+        /* =========================
+         * Класс для панорамирования/зума
+         * ========================= */
+        class WorkspaceZoom {
+            constructor(mainSvg) {
+                this.mainSvg = mainSvg;
+                this.gridGroup = mainSvg.querySelector('#gridGroup');
+                this.contentGroup = mainSvg.querySelector('#contentGroup');
+                this.workspaceContainer = document.querySelector('.workspace-container');
+
+                this.isPanning = false;
+                this.startPos = { x: 0, y: 0 };
+                this.pos = { x: 0, y: 0 };
+                this.scale = 1;
+                this.minScale = 0.5;
+                this.maxScale = 4;
+                this.minX = 0;
+                this.minY = 0;
+
+                this.initEvents();
+                this.initGrid();
+                this.updateTransform();
+            }
+
+            initEvents() {
+                // Панорамирование
+                this.mainSvg.addEventListener('mousedown', (e) => this.startPan(e));
+                document.addEventListener('mouseup', () => this.endPan());
+                document.addEventListener('mousemove', (e) => this.handlePan(e));
+
+                // Зум колесом
+                this.mainSvg.addEventListener('wheel', (e) => this.handleWheel(e), {
+                    passive: false
+                });
+            }
+
+            startPan(e) {
+                if (e.target.tagName === 'polygon') {
+                    return;  // Не начинаем панорамирование, если кликнули по полигону
+                }
+                if (e.button === 0) {
+                    this.isPanning = true;
+                    this.startPos.x = e.clientX - this.pos.x;
+                    this.startPos.y = e.clientY - this.pos.y;
+                    this.mainSvg.style.cursor = 'grabbing';
+                }
+            }
+
+            handlePan(e) {
+                if (!this.isPanning) return;
+                let dx = e.clientX - this.startPos.x;
+                let dy = e.clientY - this.startPos.y;
+
+                const containerRect = this.workspaceContainer.getBoundingClientRect();
+                const scaledWidth = containerRect.width * this.scale;
+                const scaledHeight = containerRect.height * this.scale;
+
+                // Ограничения по панорамированию, чтобы не уходить в отрицательные области
+                this.pos.x = Math.max(containerRect.width - scaledWidth, Math.min(0, dx));
+                this.pos.y = Math.max(containerRect.height - scaledHeight, Math.min(0, dy));
+
+                this.updateTransform();
+            }
+
+            endPan() {
+                this.isPanning = false;
+                this.mainSvg.style.cursor = 'grab';
+            }
+
+            handleWheel(e) {
+                e.preventDefault();
+                const zoomFactor = 1.1;
+                let newScale = this.scale;
+
+                if (e.deltaY < 0) {
+                    newScale *= zoomFactor; // увеличить
+                } else {
+                    newScale /= zoomFactor; // уменьшить
+                }
+                newScale = Math.max(this.minScale, Math.min(this.maxScale, newScale));
+
+
+                const rect = this.mainSvg.getBoundingClientRect();
+                const cx = e.clientX - rect.left;
+                const cy = e.clientY - rect.top;
+
+                // Коорд до изменения масштаба
+                const xRel = (cx - this.pos.x) / this.scale;
+                const yRel = (cy - this.pos.y) / this.scale;
+
+                this.scale = newScale;
+                this.pos.x = cx - xRel * this.scale;
+                this.pos.y = cy - yRel * this.scale;
+
+                this.checkBounds();
+                this.updateTransform();
+            }
+
+            checkBounds() {
+                const containerRect = this.workspaceContainer.getBoundingClientRect();
+                const scaledWidth = containerRect.width * this.scale;
+                const scaledHeight = containerRect.height * this.scale;
+
+
+                this.pos.x = Math.max(containerRect.width - scaledWidth, Math.min(0, this.pos.x));
+                this.pos.y = Math.max(containerRect.height - scaledHeight, Math.min(0, this.pos.y));
+            }
+
+            updateTransform() {
+                const t = `translate(${this.pos.x},${this.pos.y}) scale(${this.scale})`;
+                this.gridGroup.setAttribute('transform', t);
+                this.contentGroup.setAttribute('transform', t);
+                this.drawRulers();
+            }
+
+            initGrid() {
+                // "Бесконечная" сетка через pattern
+                const defs = document.createElementNS('http://www.w3.org/2000/svg', 'defs');
+                const pattern = document.createElementNS('http://www.w3.org/2000/svg', 'pattern');
+                pattern.id = 'gridPattern';
+                pattern.setAttribute('patternUnits', 'userSpaceOnUse');
+                pattern.setAttribute('width', 50);
+                pattern.setAttribute('height', 50);
+
+                const lineV = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+                lineV.setAttribute('x1', 0);
+                lineV.setAttribute('y1', 0);
+                lineV.setAttribute('x2', 0);
+                lineV.setAttribute('y2', 50);
+                lineV.setAttribute('stroke', 'var(--grid-color)');
+
+                const lineH = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+                lineH.setAttribute('x1', 0);
+                lineH.setAttribute('y1', 0);
+                lineH.setAttribute('x2', 50);
+                lineH.setAttribute('y2', 0);
+                lineH.setAttribute('stroke', 'var(--grid-color)');
+
+                pattern.appendChild(lineV);
+                pattern.appendChild(lineH);
+                defs.appendChild(pattern);
+                this.gridGroup.appendChild(defs);
+
+                const bigRect = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+                bigRect.setAttribute('x', -100000);
+                bigRect.setAttribute('y', -100000);
+                bigRect.setAttribute('width', 200000);
+                bigRect.setAttribute('height', 200000);
+                bigRect.setAttribute('fill', 'url(#gridPattern)');
+                this.gridGroup.appendChild(bigRect);
+            }
+            drawRulers() {
+                rulerSvg.innerHTML = '';
+                const w = rulerSvg.clientWidth;
+                const h = rulerSvg.clientHeight;
+
+                // Горизонтальная линейка
+                const horizontalRuler = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+                const horizontalLine = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+                horizontalLine.classList.add('ruler-line');
+                horizontalLine.setAttribute('x1', 0);
+                horizontalLine.setAttribute('y1', 15);
+                horizontalLine.setAttribute('x2', w);
+                horizontalLine.setAttribute('y2', 15);
+                horizontalRuler.appendChild(horizontalLine);
+
+                this.drawRulerTicks(horizontalRuler, true, this.pos.x, this.scale, w);
+                rulerSvg.appendChild(horizontalRuler);
+
+                // Вертикальная линейка
+                const verticalRuler = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+                const verticalLine = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+                verticalLine.classList.add('ruler-line');
+                verticalLine.setAttribute('x1', 20);
+                verticalLine.setAttribute('y1', 0);
+                verticalLine.setAttribute('x2', 20);
+                verticalLine.setAttribute('y2', h);
+                verticalRuler.appendChild(verticalLine);
+
+                this.drawRulerTicks(verticalRuler, false, this.pos.y, this.scale, h);
+
+                rulerSvg.appendChild(verticalRuler);
+            }
+
+            drawRulerTicks(ruler, isHorizontal, offset, scale, size) {
+                const step = 50; // Базовый шаг
+                const scaledStep = step * scale; // Шаг с учетом масштаба
+
+                const start = isHorizontal ? -offset / scale : -offset / scale;
+
+                const startTick = Math.floor(start / step) * step;
+                const endTick = start + size / scale;
+
+                for (let tick = startTick; tick < endTick; tick += step) {
+                    const pos = tick;
+                    const coord = pos * scale + offset;
+                    if (isHorizontal) {
+                        const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+                        line.classList.add('ruler-tick');
+                        line.setAttribute('x1', coord);
+                        line.setAttribute('y1', 0);
+                        line.setAttribute('x2', coord);
+                        line.setAttribute('y2', 15);
+                        ruler.appendChild(line);
+
+                        const label = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+                        label.classList.add('ruler-label');
+                        label.setAttribute('x', coord);
+                        label.setAttribute('y', 35);
+                        label.textContent = pos;
+                        ruler.appendChild(label);
+
+                    } else {
+                        const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+                        line.classList.add('ruler-tick');
+                        line.setAttribute('x1', 20);
+                        line.setAttribute('y1', coord);
+                        line.setAttribute('x2', 0);
+                        line.setAttribute('y2', coord);
+                        ruler.appendChild(line);
+
+                        const label = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+                        label.classList.add('ruler-label', 'vertical');
+                        label.setAttribute('x', 50);
+                        label.setAttribute('y', coord);
+                        label.textContent = pos;
+                        ruler.appendChild(label);
+                    }
+
+                }
+            }
+        }
+
+        /* =========================
+         * Глобальные переменные
+         * ========================= */
+        const bufferSvg = document.getElementById('bufferSvg');
+        const axesSvg = document.getElementById('axesSvg');
+        const rulerSvg = document.getElementById('rulerSvg');
+        const mainSvg = document.getElementById('mainSvg');
+        const contentGroup = document.getElementById('contentGroup');
+        const draggingSvg = document.getElementById('draggingSvg');
+
+        const workspaceZoom = new WorkspaceZoom(mainSvg);
+        workspaceZoom.drawRulers();
+
+
+        /* =========================
+         * Отрисовка статичных осей
+         * ========================= */
+        drawStaticAxes();
+        function drawStaticAxes() {
+            const w = axesSvg.clientWidth;
+            const h = axesSvg.clientHeight;
+            const axisColor = getComputedStyle(document.documentElement)
+                .getPropertyValue('--axis-color') || '#ccc';
+
+            // Ось X (внизу)
+            const xAxis = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+            xAxis.setAttribute('x1', 0);
+            xAxis.setAttribute('y1', h - 1);
+            xAxis.setAttribute('x2', w);
+            xAxis.setAttribute('y2', h - 1);
+            xAxis.setAttribute('stroke', axisColor);
+            xAxis.setAttribute('stroke-width', 2);
+            axesSvg.appendChild(xAxis);
+
+            // Ось Y (слева)
+            const yAxis = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+            yAxis.setAttribute('x1', 1);
+            yAxis.setAttribute('y1', 0);
+            yAxis.setAttribute('x2', 1);
+            yAxis.setAttribute('y2', h);
+            yAxis.setAttribute('stroke', axisColor);
+            yAxis.setAttribute('stroke-width', 2);
+            axesSvg.appendChild(yAxis);
+        }
+
+        /* =========================
+         * Кнопки (создать, сохранить, сбросить)
+         * ========================= */
+        document.getElementById('createBtn').addEventListener('click', createRandomPolygonsInBuffer);
+        document.getElementById('saveBtn').addEventListener('click', saveState);
+        document.getElementById('resetBtn').addEventListener('click', resetState);
+        loadState(); // при старте
+
+        function createRandomPolygonsInBuffer() {
+            bufferSvg.innerHTML = '';
+            const count = Math.floor(Math.random() * 5) + 5;
+            for (let i = 0; i < count; i++) {
+                const vertices = Math.floor(Math.random() * 5) + 3;
+                const shapePoints = [];
+                for (let j = 0; j < vertices; j++) {
+                    const angle = (j * 2 * Math.PI) / vertices;
+                    const radius = 20 + Math.random() * 15;
+                    const px = radius * Math.cos(angle);
+                    const py = radius * Math.sin(angle);
+                    shapePoints.push(`${px},${py}`);
+                }
+
+                const polygon = document.createElementNS('http://www.w3.org/2000/svg', 'polygon');
+                polygon.setAttribute('points', shapePoints.join(' '));
+                polygon.setAttribute('fill', 'var(--polygon-color)');
+
+                // Ставим в случайное место внутри #bufferSvg
+                const bw = bufferSvg.clientWidth;
+                const bh = bufferSvg.clientHeight;
+                const randX = Math.random() * (bw - 60) + 30;
+                const randY = Math.random() * (bh - 60) + 30;
+                polygon.setAttribute('transform', `translate(${randX},${randY})`);
+                polygon.style.cursor = 'move';
+
+                // Слушатель для переноса в рабочую зону
+                polygon.addEventListener('mousedown', startDragFromBuffer);
+                bufferSvg.appendChild(polygon);
+            }
+        }
+
+        /* =========================
+         *  Логика Drag&Drop (перенос из буфера)
+         * ========================= */
+        // Глобальные переменные для процесса перетаскивания
+        let draggedPolygon = null;
+        let offsetX = 0, offsetY = 0;
+
+        // Начинаем перетаскивать из буфера
+        function startDragFromBuffer(e) {
+            e.preventDefault();
+            draggedPolygon = e.target;
+
+            // 1. Получаем исходный transform полигона
+            const transform = draggedPolygon.getAttribute('transform') || 'translate(0,0)';
+
+            // 2. Получаем координаты клика относительно полигона
+            const pt = draggingSvg.createSVGPoint();
+            pt.x = e.clientX;
+            pt.y = e.clientY;
+            const svgP = pt.matrixTransform(draggingSvg.getScreenCTM().inverse());
+
+            const polygonCTM = draggedPolygon.getScreenCTM();
+            const localClick = pt.matrixTransform(polygonCTM.inverse());
+
+            offsetX = localClick.x;
+            offsetY = localClick.y;
+
+            // 3. Скрываем полигон
+            draggedPolygon.style.display = 'none';
+
+            // 4. Устанавливаем transform для draggingSvg
+            draggedPolygon.setAttribute('transform', `translate(${svgP.x - offsetX},${svgP.y - offsetY})`);
+
+            // Перемещаем draggedPolygon в draggingSvg
+            draggingSvg.appendChild(draggedPolygon);
+            // Обновляем стили:
+            draggedPolygon.style.cursor = 'grabbing';
+            draggedPolygon.style.display = '';
+
+            document.addEventListener('mousemove', onDragging);
+            document.addEventListener('mouseup', onDrop);
+        }
+
+
+        function onDrop(e) {
+            document.removeEventListener('mousemove', onDragging);
+            document.removeEventListener('mouseup', onDrop);
+
+            if (!draggedPolygon) return;
+
+            // Проверяем, попадаем ли в #mainSvg
+            const mainRect = mainSvg.getBoundingClientRect();
+            const x = e.clientX,
+                y = e.clientY;
+            if (
+                x >= mainRect.left &&
+                x <= mainRect.right &&
+                y >= mainRect.top &&
+                y <= mainRect.bottom
+            ) {
+                // Переносим в contentGroup (учитывая pan/zoom и snap)
+                const {
+                    pos,
+                    scale
+                } = workspaceZoom;
+                const localX = (x - mainRect.left - pos.x) / scale;
+                const localY = (y - mainRect.top - pos.y) / scale;
+
+                const step =
+                    parseFloat(
+                        getComputedStyle(document.documentElement).getPropertyValue(
+                            '--grid-step'
+                        )
+                    ) || 50;
+                const snappedX = Math.round(localX / step) * step;
+                const snappedY = Math.round(localY / step) * step;
+
+                draggedPolygon.setAttribute(
+                    'transform',
+                    `translate(${snappedX},${snappedY})`
+                );
+                draggedPolygon.style.cursor = 'move';
+
+                // Теперь этот polygon «живёт» в рабочей зоне
+                // Добавим возможность двигать его и там (если нужно):
+                draggedPolygon.removeEventListener('mousedown', startDragFromBuffer);
+                draggedPolygon.addEventListener('mousedown', startDragFromWorkspace);
+
+                contentGroup.appendChild(draggedPolygon);
+
+            } else {
+                // Если не попадаем, возвращаем элемент обратно в буфер, показываем
+                draggedPolygon.style.display = '';
+                bufferSvg.appendChild(draggedPolygon);
+                draggedPolygon.addEventListener('mousedown', startDragFromBuffer);
+            }
+
+            // Очищаем элемент
+            if (draggingSvg.contains(draggedPolygon)) {
+                draggingSvg.removeChild(draggedPolygon);
+            }
+            draggedPolygon = null;
+        }
+        function onDragging(e) {
+            if (!draggedPolygon) return;
+            e.preventDefault();
+
+            const pt = draggingSvg.createSVGPoint();
+            pt.x = e.clientX;
+            pt.y = e.clientY;
+            const svgP = pt.matrixTransform(draggingSvg.getScreenCTM().inverse());
+
+            const dx = svgP.x;
+            const dy = svgP.y;
+            draggedPolygon.setAttribute('transform', `translate(${dx},${dy})`);
+        }
+
+        function onDrop(e) {
+            document.removeEventListener('mousemove', onDragging);
+            document.removeEventListener('mouseup', onDrop);
+
+            if (!draggedPolygon) return;
+
+            // Проверяем, попадаем ли в #mainSvg
+            const mainRect = mainSvg.getBoundingClientRect();
+            const x = e.clientX, y = e.clientY;
+
+
+            if (x >= mainRect.left && x <= mainRect.right &&
+                y >= mainRect.top && y <= mainRect.bottom) {
+                // Переносим в contentGroup (учитывая pan/zoom и snap)
+                const {
+                    pos,
+                    scale
+                } = workspaceZoom;
+                const localX = (x - mainRect.left - pos.x) / scale;
+                const localY = (y - mainRect.top - pos.y) / scale;
+
+                const step = parseFloat(getComputedStyle(document.documentElement)
+                    .getPropertyValue('--grid-step')) || 50;
+                const snappedX = Math.round(localX / step) * step;
+                const snappedY = Math.round(localY / step) * step;
+
+                draggedPolygon.setAttribute('transform', `translate(${snappedX},${snappedY})`);
+                draggedPolygon.style.cursor = 'move';
+
+                // Теперь этот polygon «живёт» в рабочей зоне
+                // Добавим возможность двигать его и там (если нужно):
+                draggedPolygon.removeEventListener('mousedown', startDragFromBuffer);
+                draggedPolygon.addEventListener('mousedown', startDragFromWorkspace);
+
+
+                contentGroup.appendChild(draggedPolygon);
+            } else {
+                // Получаем коорд мыши относительно буфера
+                const bufferRect = bufferSvg.getBoundingClientRect();
+                const localX = e.clientX - bufferRect.left;
+                const localY = e.clientY - bufferRect.top;
+
+                // Возвращаем в буфер с новыми координатами
+                draggedPolygon.setAttribute('transform', `translate(${localX},${localY})`);
+                draggedPolygon.style.cursor = 'move';
+                draggedPolygon.style.display = '';
+                bufferSvg.appendChild(draggedPolygon);
+                draggedPolygon.addEventListener('mousedown', startDragFromBuffer);
+
+            }
+
+            // Удаляем из draggingSvg
+            if (draggingSvg.contains(draggedPolygon)) {
+                draggingSvg.removeChild(draggedPolygon);
+            }
+            draggedPolygon = null;
+        }
+        /* =========================
+         *  Перетаскивание фигур внутри рабочей зоны
+         *  (не обязательно, но часто нужно)
+         * ========================= */
+        function startDragFromWorkspace(e) {
+            e.preventDefault();
+            draggedPolygon = e.target;
+
+            // 1. Получаем исходный transform полигона
+            const transform = draggedPolygon.getAttribute('transform') || 'translate(0,0)';
+
+            // 2. Получаем координаты клика относительно полигона
+            const pt = draggingSvg.createSVGPoint();
+            pt.x = e.clientX;
+            pt.y = e.clientY;
+            const svgP = pt.matrixTransform(draggingSvg.getScreenCTM().inverse());
+
+            const polygonCTM = draggedPolygon.getScreenCTM();
+            const localClick = pt.matrixTransform(polygonCTM.inverse());
+
+            offsetX = localClick.x;
+            offsetY = localClick.y;
+
+            // 3. Скрываем полигон
+            draggedPolygon.style.display = 'none';
+
+
+            // 4. Устанавливаем transform для draggingSvg
+            draggedPolygon.setAttribute('transform', `translate(${svgP.x - offsetX},${svgP.y - offsetY})`);
+
+
+            // Перемещаем draggedPolygon в draggingSvg
+            draggingSvg.appendChild(draggedPolygon);
+            // Обновляем стили:
+            draggedPolygon.style.cursor = 'grabbing';
+            draggedPolygon.style.display = '';
+
+            document.addEventListener('mousemove', onDragging);
+            document.addEventListener('mouseup', onDropFromWorkspace);
+        }
+
+
+        function onDropFromWorkspace(e) {
+            document.removeEventListener('mousemove', onDragging);
+            document.removeEventListener('mouseup', onDropFromWorkspace);
+
+            if (!draggedPolygon) return;
+
+
+            // Проверяем, попадаем ли в #bufferSvg
+            const bufferRect = bufferSvg.getBoundingClientRect();
+            const x = e.clientX,
+                y = e.clientY;
+
+
+            if (
+                x >= bufferRect.left &&
+                x <= bufferRect.right &&
+                y >= bufferRect.top &&
+                y <= bufferRect.bottom
+            ) {
+                // Получаем коорд мыши относительно буфера
+                const localX = e.clientX - bufferRect.left;
+                const localY = e.clientY - bufferRect.top;
+
+                // Возвращаем в буфер с новыми координатами
+                draggedPolygon.setAttribute('transform', `translate(${localX},${localY})`);
+                draggedPolygon.style.cursor = 'move';
+                draggedPolygon.style.display = '';
+                bufferSvg.appendChild(draggedPolygon);
+                draggedPolygon.addEventListener('mousedown', startDragFromBuffer);
+                draggedPolygon.removeEventListener('mousedown', startDragFromWorkspace);
+
+            } else {
+                // Возвращаем в content с тем же трансформом
+                draggedPolygon.style.display = '';
+                contentGroup.appendChild(draggedPolygon);
+                draggedPolygon.addEventListener('mousedown', startDragFromWorkspace);
+
+            }
+
+
+
+            // Очищаем элемент
+            if (draggingSvg.contains(draggedPolygon)) {
+                draggingSvg.removeChild(draggedPolygon);
+            }
+            draggedPolygon = null;
+        }
+        let currentPolygon = null;
+        let startMx = 0, startMy = 0;
+        let initTx = 0, initTy = 0;
+
+
+        function movePolygonInside(e) {
+            if (!currentPolygon) return;
+            e.preventDefault();
+            const dx = e.clientX - startMx;
+            const dy = e.clientY - startMy;
+            // Учитываем текущий масштаб, чтобы «шаг» движений совпадал с реальным
+            const newX = initTx + dx / workspaceZoom.scale;
+            const newY = initTy + dy / workspaceZoom.scale;
+
+            currentPolygon.setAttribute('transform', `translate(${newX},${newY})`);
+        }
+
+        function dropPolygonInside(e) {
+            document.removeEventListener('mousemove', movePolygonInside);
+            document.removeEventListener('mouseup', dropPolygonInside);
+
+            if (!currentPolygon) return;
+
+            // Snap к сетке при отпускании
+            const tf = currentPolygon.getAttribute('transform') || 'translate(0,0)';
+            const match = /translate\s*\(\s*([^\s,]+)\s*,\s*([^\s,)]+)/.exec(tf);
+            let finalX = parseFloat(match?.[1]) || 0;
+            let finalY = parseFloat(match?.[2]) || 0;
+
+            const step = parseFloat(getComputedStyle(document.documentElement)
+                .getPropertyValue('--grid-step')) || 50;
+            finalX = Math.round(finalX / step) * step;
+            finalY = Math.round(finalY / step) * step;
+
+            currentPolygon.setAttribute('transform', `translate(${finalX},${finalY})`);
+            currentPolygon.style.cursor = 'move';
+            currentPolygon = null;
+        }
+
+        /* =========================
+         *  Сохранение/загрузка
+         * ========================= */
+        function saveState() {
+            const state = {
+                buffer: bufferSvg.innerHTML,
+                content: contentGroup.innerHTML,
+                pos: workspaceZoom.pos,
+                scale: workspaceZoom.scale
+            };
+            localStorage.setItem('polygonsSvgApp', JSON.stringify(state));
+        }
+
+        function loadState() {
+            const raw = localStorage.getItem('polygonsSvgApp');
+            if (!raw) return;
+
+            const st = JSON.parse(raw);
+            bufferSvg.innerHTML = st.buffer;
+            contentGroup.innerHTML = st.content;
+            workspaceZoom.pos = st.pos || { x: 0, y: 0 };
+            workspaceZoom.scale = st.scale || 1;
+            workspaceZoom.updateTransform();
+
+            // Восстанавливаем события
+            [...bufferSvg.querySelectorAll('polygon')].forEach(pg => {
+                pg.addEventListener('mousedown', startDragFromBuffer);
+            });
+            [...contentGroup.querySelectorAll('polygon')].forEach(pg => {
+                pg.addEventListener('mousedown', startDragFromWorkspace);
+            });
+        }
+
+        function resetState() {
+            localStorage.removeItem('polygonsSvgApp');
+            bufferSvg.innerHTML = '';
+            contentGroup.innerHTML = '';
+            workspaceZoom.pos = { x: 0, y: 0 };
+            workspaceZoom.scale = 1;
+            workspaceZoom.updateTransform();
+        }
+    </script>
+</body>
+
+</html>
